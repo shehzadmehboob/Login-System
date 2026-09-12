@@ -1,8 +1,10 @@
+require("dotenv").config();
+
 const express = require('express');
 const { sql, poolPromise } = require("./db");
 const bcrypt = require("bcrypt");
+const cookieParser = require("cookie-parser");
 
-require("dotenv").config();
 
 const jwt = require("jsonwebtoken");
 
@@ -15,7 +17,7 @@ app.set("view engine", "ejs");
 app.use(express.urlencoded({ extended: true }));
 
 
-
+app.use(cookieParser());
 
 app.get("/", async (req, res) => {
     try {
@@ -111,7 +113,15 @@ app.post("/login", async (req, res)=>{
                 { expiresIn: "30d" }
             );
 
-            res.json({ token });
+            
+            res.cookie("token", token, {
+                httpOnly: true,
+                secure: false,
+                sameSite: 'lax',
+                maxAge: 30 * 24 * 60 * 60 * 1000
+            })
+
+            res.redirect("/home");
 
         } else {
             res.status(401).send("Invalid email or password");
@@ -127,13 +137,11 @@ app.post("/login", async (req, res)=>{
 
 function requireJWT(req, res, next) {
 
-    const authHeader = req.headers.authorization;
+    const token = req.cookies.token;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!token) {
         return res.status(401).send("Access denied");
     }
-
-    const token = authHeader.split(" ")[1];
 
     try {
 
@@ -172,7 +180,10 @@ app.get("/home", requireJWT, async (req, res) => {
     }
 });
 
-
+app.get("/logout", (req, res) => {
+    res.clearCookie("token");
+    res.redirect("/login");
+});
 
 
 app.get("/jwt-test", requireJWT, (req, res)=>{
