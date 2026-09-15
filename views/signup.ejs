@@ -18,6 +18,40 @@
 
     <p>Already have an account? <a href="/login">Login</a></p>
 
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+    <div id="g_id_onload"
+        data-client_id="<%= googleClientId %>"
+        data-callback="handleGoogleLogin">
+    </div>
+    <div class="g_id_signin"></div>
+
+    <script>
+        async function handleGoogleLogin(response) {
+
+            console.log("Google callback called");
+            
+            const idToken = response.credential;
+
+            const result = await fetch("/auth/google", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    credential: idToken
+                })
+            });
+
+            if (result.redirected) {
+                window.location.href = result.url;
+            } else {
+                const message = await result.text();
+                alert(message);
+            }
+        }
+    </script>
+
 
 </body>
 </html>

@@ -8,14 +8,18 @@ const { randomInt } = require("crypto");
 const transporter = require("./mailer");
 const session = require("express-session");
 const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 
 const app = express();
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
 app.set("view engine", "ejs");
 
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 app.use(cookieParser());
 
 app.use(
@@ -52,18 +56,17 @@ app.get("/", async (req, res) => {
 app.get("/signup", (req, res) => {
 
     res.render("signup", {
-        error: null
+        error: null,
+        googleClientId: process.env.GOOGLE_CLIENT_ID
     });
 
 });
 
 
 app.post("/signup", async (req, res) => {
-
     const { email, password } = req.body;
 
     try {
-
         const pool = await poolPromise;
 
         const result = await pool.request()
@@ -74,52 +77,52 @@ app.post("/signup", async (req, res) => {
                 WHERE Email = @email
             `);
 
+        const user = result.recordset[0];
 
-        const existingUser = result.recordset[0];
+        if (user) {
 
-        if (existingUser) {
-
-            if (existingUser.IsVerified) {
-
+            if (user.IsVerified) {
                 return res.render("signup", {
-                    error: "User already exists"
+                    error: "User already exists",
+                    googleClientId: process.env.GOOGLE_CLIENT_ID
                 });
-
             }
+
+            const passwordHash = await bcrypt.hash(password, 10);
+
+            await pool.request()
+                .input("id", sql.Int, user.Id)
+                .input("passwordHash", sql.NVarChar, passwordHash)
+                .query(`
+                    UPDATE Users
+                    SET PasswordHash = @passwordHash
+                    WHERE Id = @id
+                `);
 
             const code = randomInt(100000, 1000000);
 
-
-            req.session.verificationUserId = existingUser.Id;
+            req.session.verificationUserId = user.Id;
             req.session.verificationCode = code;
 
-
             await transporter.sendMail({
-
                 from: process.env.EMAIL,
-
                 to: email,
-
-                subject: "Email verification code",
-
+                subject: "Email Verification",
                 text: `Your verification code is ${code}`
-
             });
 
             return res.redirect("/verify");
-
         }
 
-
-        const hashedPassword = await bcrypt.hash(password, 10);
+        const passwordHash = await bcrypt.hash(password, 10);
 
         const insertResult = await pool.request()
             .input("email", sql.NVarChar, email)
-            .input("password", sql.NVarChar, hashedPassword)
+            .input("passwordHash", sql.NVarChar, passwordHash)
             .query(`
-                INSERT INTO Users (Email, PasswordHash)
+                INSERT INTO Users (Email, PasswordHash, IsVerified)
                 OUTPUT INSERTED.Id
-                VALUES (@email, @password)
+                VALUES (@email, @passwordHash, 0)
             `);
 
         const userId = insertResult.recordset[0].Id;
@@ -130,25 +133,18 @@ app.post("/signup", async (req, res) => {
         req.session.verificationCode = code;
 
         await transporter.sendMail({
-
             from: process.env.EMAIL,
             to: email,
-            subject: "Email verification code",
+            subject: "Email Verification",
             text: `Your verification code is ${code}`
-
         });
 
         res.redirect("/verify");
 
-
     } catch (error) {
-
         console.log(error);
-
         res.status(500).send("Something went wrong");
-
     }
-
 });
 
 app.get("/verify", (req, res) => {
@@ -164,37 +160,24 @@ app.post("/verify", async (req, res) => {
 
     const enteredCode = Number(req.body.code);
 
-    if (
-        !req.session.verificationCode ||
-        !req.session.verificationUserId
-    ) {
-
+    if (!req.session.verificationCode || !req.session.verificationUserId) {
         return res.status(400).send(
             "Verification session expired"
         );
-
     }
 
-
     if (enteredCode !== req.session.verificationCode) {
-
         return res.render("verify", {
             error: "Wrong verification code"
         });
-
     }
 
 
     try {
-
         const pool = await poolPromise;
 
         await pool.request()
-            .input(
-                "id",
-                sql.Int,
-                req.session.verificationUserId
-            )
+            .input("id", sql.Int, req.session.verificationUserId)
             .query(`
                 UPDATE Users
                 SET IsVerified = 1
@@ -212,7 +195,6 @@ app.post("/verify", async (req, res) => {
     } catch (error) {
 
         console.log(error);
-
         res.status(500).send("Something went wrong");
 
     }
@@ -221,8 +203,11 @@ app.post("/verify", async (req, res) => {
 
 app.get("/login", (req, res) => {
 
+    console.log("Google Client ID:", process.env.GOOGLE_CLIENT_ID);
+
     res.render("login", {
-        error: null
+        error: null,
+        googleClientId: process.env.GOOGLE_CLIENT_ID
     });
 
 });
@@ -391,6 +376,102 @@ app.get("/jwt-test", requireJWT, (req, res) => {
         `You are user ${req.userId}`
     );
 
+});
+
+app.post("/auth/google", async (req, res) => {
+
+    console.log("Google auth route reached");
+
+    const { credential } = req.body;
+
+    try {
+        const ticket = await googleClient.verifyIdToken({
+            idToken: credential,
+            audience: process.env.GOOGLE_CLIENT_ID
+        });
+
+        const payload = ticket.getPayload();
+        
+        const googleSub = payload.sub;
+        const email = payload.email;
+        const emailVerified = payload.email_verified;
+
+        if (!emailVerified) {
+            return res.status(401).send("Google email is not verified");
+        }
+
+        const pool = await poolPromise;
+
+        const googleResult = await pool.request()
+            .input("googleSub", sql.NVarChar, googleSub)
+            .query(`
+                SELECT *
+                FROM Users
+                WHERE GoogleSub = @googleSub
+            `);
+
+            let user = googleResult.recordset[0];
+
+            if (!user)  {
+                const emailResult = await pool.request()
+                    .input("email", sql.NVarChar, email)
+                    .query(`
+                        SELECT *
+                        FROM Users
+                        WHERE Email = @email    
+                    `);
+
+                user = emailResult.recordset[0];
+
+                if (user) {
+                    await pool.request()
+                        .input("id", sql.Int, user.id)
+                        .input("googleSub", sql.NVarChar, googleSub)
+                        .query(`
+                            UPDATE Users
+                            SET GoogleSub = @googleSub,
+                            IsVerified = 1
+                            Where Id = @id
+                        `);
+                } else {
+                    const insertResult = await pool.request()
+                        .input("email", sql.NVarChar, email)
+                        .input("googleSub", sql.NVarChar, googleSub)
+                        .query(`
+                            INSERT INTO Users (Email, PasswordHash, GoogleSub, IsVerified)
+                            OUTPUT INSERTED.Id
+                            VALUES (@email, NULL, @googleSub, 1)
+                        `);
+
+                    user = {
+                        Id: insertResult.recordset[0].Id
+                    };
+                }
+            }
+
+            const token = jwt.sign(
+                {
+                    userId: user.Id
+                },
+                JWT_SECRET,
+                {
+                    expiresIn: "30d"
+                }
+            );
+
+            res.cookie("token", token, {
+                httpOnly: true,
+                secure: false,
+                sameSite: "lax",
+                maxAge: 30 * 24 * 60 * 60 * 1000
+            });
+
+        res.redirect("/home");
+
+    } catch (error) {
+        console.log(error);
+        res.status(401).send("Invalid Google token");
+    }
 });
 
 app.listen(3000, () => {
